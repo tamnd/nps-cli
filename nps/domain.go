@@ -9,69 +9,76 @@ import (
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes nps as a kit Domain: a driver that a multi-domain
+// domain.go exposes the NPS API as a kit Domain: a driver that a multi-domain
 // host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/nps-cli/nps"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// nps:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone nps binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The same Domain also builds the standalone nps binary (see cli.NewApp),
+// so the binary and a host share one source of truth.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the nps driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "nps",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "nps",
-			Short:  "A command line for nps.",
-			Long: `A command line for nps.
+			Short:  "A command line for the National Park Service.",
+			Long: `A command line for the National Park Service (NPS) public API.
 
-nps reads public nps data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+nps reads public NPS data over plain HTTPS, shapes it into
+clean records, and prints output that pipes into the rest of your tools.
+Uses the NPS Data API (developer.nps.gov). Register a free key at:
+https://www.nps.gov/subjects/digital/nps-data-api.htm`,
+			Site: "https://" + Host,
 			Repo: "https://github.com/tamnd/nps-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `nps page` and
-	// `ant get nps://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "parks",
+		Group:   "read",
+		List:    true,
+		Summary: "List national parks, filtered by state or park code",
+	}, listParks)
 
-	// List op: members of a page, the home of `nps links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// nps://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "campgrounds",
+		Group:   "read",
+		List:    true,
+		Summary: "List campgrounds, filtered by state or park code",
+	}, listCampgrounds)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "alerts",
+		Group:   "read",
+		List:    true,
+		Summary: "List park alerts",
+	}, listAlerts)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "visitor-centers",
+		Group:   "read",
+		List:    true,
+		Summary: "List visitor centers, filtered by state or park code",
+	}, listVisitorCenters)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,46 +89,115 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type parksIn struct {
+	State string `kit:"flag" help:"two-letter state code (e.g. CA)"`
+	Code  string `kit:"flag" help:"park code (e.g. grca)"`
+	Limit int    `kit:"flag,inherit" help:"max results"`
+	Key   string `kit:"flag" help:"NPS API key" default:"DEMO_KEY"`
+
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type campgroundsIn struct {
+	State string `kit:"flag" help:"two-letter state code (e.g. CA)"`
+	Park  string `kit:"flag" help:"park code (e.g. yose)"`
+	Limit int    `kit:"flag,inherit" help:"max results"`
+	Key   string `kit:"flag" help:"NPS API key" default:"DEMO_KEY"`
+
+	Client *Client `kit:"inject"`
+}
+
+type alertsIn struct {
+	Park  string `kit:"flag" help:"park code (e.g. yell)"`
+	Limit int    `kit:"flag,inherit" help:"max results"`
+	Key   string `kit:"flag" help:"NPS API key" default:"DEMO_KEY"`
+
+	Client *Client `kit:"inject"`
+}
+
+type visitorCentersIn struct {
+	State string `kit:"flag" help:"two-letter state code (e.g. CA)"`
+	Park  string `kit:"flag" help:"park code (e.g. yose)"`
+	Limit int    `kit:"flag,inherit" help:"max results"`
+	Key   string `kit:"flag" help:"NPS API key" default:"DEMO_KEY"`
+
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listParks(ctx context.Context, in parksIn, emit func(*Park) error) error {
+	in.Client.cfg.APIKey = in.Key
+	parks, err := in.Client.Parks(ctx, ParksInput{
+		State:    in.State,
+		ParkCode: in.Code,
+		Limit:    in.Limit,
+	})
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
+	for i := range parks {
+		if err := emit(&parks[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func listCampgrounds(ctx context.Context, in campgroundsIn, emit func(*Campground) error) error {
+	in.Client.cfg.APIKey = in.Key
+	camps, err := in.Client.Campgrounds(ctx, CampgroundsInput{
+		State:    in.State,
+		ParkCode: in.Park,
+		Limit:    in.Limit,
+	})
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range camps {
+		if err := emit(&camps[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listAlerts(ctx context.Context, in alertsIn, emit func(*Alert) error) error {
+	in.Client.cfg.APIKey = in.Key
+	alerts, err := in.Client.Alerts(ctx, AlertsInput{
+		ParkCode: in.Park,
+		Limit:    in.Limit,
+	})
+	if err != nil {
+		return err
+	}
+	for i := range alerts {
+		if err := emit(&alerts[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listVisitorCenters(ctx context.Context, in visitorCentersIn, emit func(*VisitorCenter) error) error {
+	in.Client.cfg.APIKey = in.Key
+	vcs, err := in.Client.VisitorCenters(ctx, VisitorCentersInput{
+		State:    in.State,
+		ParkCode: in.Park,
+		Limit:    in.Limit,
+	})
+	if err != nil {
+		return err
+	}
+	for i := range vcs {
+		if err := emit(&vcs[i]); err != nil {
 			return err
 		}
 	}
@@ -130,44 +206,27 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 
 // --- Resolver: the URI-native string functions, pure and network-free ---
 
-// Classify turns any accepted input — a bare path or a full nps.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns any accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
+	input = strings.TrimSpace(input)
+	if u, e := url.Parse(input); e == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		// treat the path as a page id for generic linking
+		id = strings.Trim(u.Path, "/")
+	} else {
+		id = strings.Trim(input, "/")
+	}
 	if id == "" {
 		return "", "", errs.Usage("unrecognized nps reference: %q", input)
 	}
-	return "page", id, nil
+	return "park", id, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "park":
+		return "https://www.nps.gov/" + strings.Trim(id, "/"), nil
+	default:
 		return "", errs.Usage("nps has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }

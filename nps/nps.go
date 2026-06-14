@@ -1,62 +1,80 @@
 // Package nps is the library behind the nps command line:
-// the HTTP client, request shaping, and the typed data models for nps.
+// the HTTP client, request shaping, and the typed data models for the
+// National Park Service (NPS) public API.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package nps
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to nps. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "nps/dev (+https://github.com/tamnd/nps-cli)"
+// Host is the NPS API host. Used in domain.go for the driver's host list.
+const Host = "developer.nps.gov"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at nps.com; change it once you
-// know the real endpoints you want to read.
-const Host = "nps.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to nps over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunable knobs for the Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	APIKey    string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
+// DefaultConfig returns sensible defaults for the NPS API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://developer.nps.gov/api/v1",
+		UserAgent: "nps-cli/0.1.0 (github.com/tamnd/nps-cli)",
+		APIKey:    "DEMO_KEY",
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the NPS API over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client using the provided Config.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// get appends api_key to the given URL and fetches the body.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("api_key", c.cfg.APIKey)
+	u.RawQuery = q.Encode()
+	return c.fetch(ctx, u.String())
+}
+
+// fetch executes the request with pacing and retry.
+func (c *Client) fetch(ctx context.Context, endpoint string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +82,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, endpoint)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +91,18 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", endpoint, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, endpoint string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -104,12 +122,14 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// pace blocks until at least cfg.Rate has elapsed since the last request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +143,205 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on nps.com. It is a stand-in for the typed records you
-// will model from the real nps endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `nps cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// apiResponse is the common envelope for all NPS API list responses.
+type apiResponse[T any] struct {
+	Total string `json:"total"`
+	Limit string `json:"limit"`
+	Start string `json:"start"`
+	Data  []T    `json:"data"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// --- Data models ---
+
+// Park is a national park unit returned by the /parks endpoint.
+type Park struct {
+	ID          string `json:"id"`
+	Code        string `json:"parkCode"`
+	Name        string `json:"fullName"`
+	Description string `json:"description"`
+	States      string `json:"states"`
+	URL         string `json:"url"`
+	LatLong     string `json:"latLong,omitempty"`
+}
+
+// Campground is returned by the /campgrounds endpoint.
+type Campground struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	ParkCode        string `json:"parkCode"`
+	Description     string `json:"description"`
+	URL             string `json:"url,omitempty"`
+	Latitude        string `json:"latitude,omitempty"`
+	Longitude       string `json:"longitude,omitempty"`
+	ReservableSites string `json:"numberOfSitesReservable,omitempty"`
+	WalkupSites     string `json:"numberOfSitesFirstComeFirstServe,omitempty"`
+}
+
+// Alert is returned by the /alerts endpoint.
+type Alert struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Category    string `json:"category"`
+	ParkCode    string `json:"parkCode"`
+	URL         string `json:"url,omitempty"`
+}
+
+// VisitorCenter is returned by the /visitor-centers endpoint.
+type VisitorCenter struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	ParkCode    string `json:"parkCode"`
+	Description string `json:"description"`
+	URL         string `json:"url,omitempty"`
+	Latitude    string `json:"latitude,omitempty"`
+	Longitude   string `json:"longitude,omitempty"`
+}
+
+// --- ParksInput and Parks ---
+
+// ParksInput controls the /parks query.
+type ParksInput struct {
+	State    string // two-letter state code, e.g. "CA"
+	ParkCode string // e.g. "grca"
+	Limit    int    // 0 means server default (50)
+	Start    int    // pagination offset
+}
+
+// Parks fetches parks from the NPS API.
+func (c *Client) Parks(ctx context.Context, in ParksInput) ([]Park, error) {
+	u, _ := url.Parse(c.cfg.BaseURL + "/parks")
+	q := u.Query()
+	if in.State != "" {
+		q.Set("stateCode", in.State)
+	}
+	if in.ParkCode != "" {
+		q.Set("parkCode", in.ParkCode)
+	}
+	if in.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", in.Limit))
+	}
+	if in.Start > 0 {
+		q.Set("start", fmt.Sprintf("%d", in.Start))
+	}
+	u.RawQuery = q.Encode()
+	body, err := c.get(ctx, u.String())
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	var resp apiResponse[Park]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse parks: %w", err)
+	}
+	return resp.Data, nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// --- CampgroundsInput and Campgrounds ---
+
+// CampgroundsInput controls the /campgrounds query.
+type CampgroundsInput struct {
+	State    string
+	ParkCode string
+	Limit    int
+	Start    int
+}
+
+// Campgrounds fetches campgrounds from the NPS API.
+func (c *Client) Campgrounds(ctx context.Context, in CampgroundsInput) ([]Campground, error) {
+	u, _ := url.Parse(c.cfg.BaseURL + "/campgrounds")
+	q := u.Query()
+	if in.State != "" {
+		q.Set("stateCode", in.State)
+	}
+	if in.ParkCode != "" {
+		q.Set("parkCode", in.ParkCode)
+	}
+	if in.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", in.Limit))
+	}
+	if in.Start > 0 {
+		q.Set("start", fmt.Sprintf("%d", in.Start))
+	}
+	u.RawQuery = q.Encode()
+	body, err := c.get(ctx, u.String())
 	if err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	var resp apiResponse[Campground]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse campgrounds: %w", err)
 	}
-	return out, nil
+	return resp.Data, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// --- AlertsInput and Alerts ---
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// AlertsInput controls the /alerts query.
+type AlertsInput struct {
+	ParkCode string
+	Limit    int
+	Start    int
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// Alerts fetches alerts from the NPS API.
+func (c *Client) Alerts(ctx context.Context, in AlertsInput) ([]Alert, error) {
+	u, _ := url.Parse(c.cfg.BaseURL + "/alerts")
+	q := u.Query()
+	if in.ParkCode != "" {
+		q.Set("parkCode", in.ParkCode)
 	}
-	return s
+	if in.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", in.Limit))
+	}
+	if in.Start > 0 {
+		q.Set("start", fmt.Sprintf("%d", in.Start))
+	}
+	u.RawQuery = q.Encode()
+	body, err := c.get(ctx, u.String())
+	if err != nil {
+		return nil, err
+	}
+	var resp apiResponse[Alert]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse alerts: %w", err)
+	}
+	return resp.Data, nil
+}
+
+// --- VisitorCentersInput and VisitorCenters ---
+
+// VisitorCentersInput controls the /visitor-centers query.
+type VisitorCentersInput struct {
+	State    string
+	ParkCode string
+	Limit    int
+	Start    int
+}
+
+// VisitorCenters fetches visitor centers from the NPS API.
+func (c *Client) VisitorCenters(ctx context.Context, in VisitorCentersInput) ([]VisitorCenter, error) {
+	u, _ := url.Parse(c.cfg.BaseURL + "/visitor-centers")
+	q := u.Query()
+	if in.State != "" {
+		q.Set("stateCode", in.State)
+	}
+	if in.ParkCode != "" {
+		q.Set("parkCode", in.ParkCode)
+	}
+	if in.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", in.Limit))
+	}
+	if in.Start > 0 {
+		q.Set("start", fmt.Sprintf("%d", in.Start))
+	}
+	u.RawQuery = q.Encode()
+	body, err := c.get(ctx, u.String())
+	if err != nil {
+		return nil, err
+	}
+	var resp apiResponse[VisitorCenter]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse visitor-centers: %w", err)
+	}
+	return resp.Data, nil
 }
